@@ -17,16 +17,27 @@ from chesscrypt.lichess import (
     LichessMatchOrchestrator,
     SimulatedLichessServer,
 )
+from chesscrypt.viewer import enable_terminal_ansi, play_2d_terminal_match
+
+
+def _print_banner(message: str) -> None:
+    enable_terminal_ansi()
+    print("╭──────────────────────────────────────────────────────────────────────────────────╮")
+    print("│ ♟  CHESSCRYPT TERMINAL ARENA  •  UNRATED LICHESS BOT STORAGE                     │")
+    print(f"│    Bots   : {BOT_WHITE_NAME} (White) vs {BOT_BLACK_NAME} (Black)                         │")
+    print(f"│    Secret : {message!r:<68s} │")
+    print("╰──────────────────────────────────────────────────────────────────────────────────╯")
 
 
 def _cmd_demo(args: argparse.Namespace) -> int:
-    message = args.message or "Hello World"
-    passphrase = args.passphrase or None
+    message = getattr(args, "message", None) or "Hello World"
+    passphrase = getattr(args, "passphrase", None) or None
+    delay = getattr(args, "delay", 0.20)
+    step_mode = getattr(args, "step", False)
+    all_plies = getattr(args, "all_plies", False)
+    color_flag = getattr(args, "color", None)
 
-    print("=" * 76)
-    print(f"ChessCrypt MVP Demo — Encrypting & Decrypting: {message!r}")
-    print(f"Unrated Lichess Bots: {BOT_WHITE_NAME} (White) vs {BOT_BLACK_NAME} (Black)")
-    print("=" * 76)
+    _print_banner(message)
 
     games = encode_text(
         message,
@@ -36,11 +47,19 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     )
     for g in games:
         print()
+        play_2d_terminal_match(
+            g,
+            delay=delay,
+            step_mode=step_mode,
+            show_all_plies=all_plies,
+            use_color=color_flag,
+        )
+        print()
         print(g.format_trace_markdown())
         print("\nGenerated PGN:")
-        print("-" * 40)
+        print("─" * 60)
         print(g.to_pgn())
-        print("-" * 40)
+        print("─" * 60)
 
     # Play out the unrated match on the Lichess Bot Simulator
     server = SimulatedLichessServer()
@@ -51,23 +70,26 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
     records = [orchestrator.play_encoded_game(g) for g in games]
     game_ids = [r.game_id for r in records]
-    print(f"\n[Lichess Unrated Bot Match Completed]")
+    print("\n╭── Lichess Unrated Bot Match Completed ───────────────────────────────────────────╮")
     for r in records:
         print(
-            f"  Game ID: {r.game_id} | Rated: {r.rated} | "
-            f"{r.white_bot} vs {r.black_bot} | Plies: {r.plies_played}"
+            f"│  Game ID : {r.game_id:<12s} | Rated: {str(r.rated):<5s} | "
+            f"{r.white_bot} vs {r.black_bot} ({r.plies_played} plies)"
         )
+    print("╰──────────────────────────────────────────────────────────────────────────────────╯")
 
     decoded = orchestrator.fetch_and_decode(game_ids, passphrase=passphrase)
-    print("\n[Decryption Verification]")
-    print(f"  Recovered BigInt(s): {decoded.recovered_bigints}")
-    print(f"  Recovered Hex Bytes: {decoded.decrypted_bytes.hex(' ')}")
-    print(f"  Decrypted Message  : {decoded.text!r}")
+    print("\n╭── Decryption Verification ───────────────────────────────────────────────────────╮")
+    print(f"│  Recovered BigInt(s) : {decoded.recovered_bigints}")
+    print(f"│  Recovered Hex Bytes : {decoded.decrypted_bytes.hex(' ')}")
+    print(f"│  Decrypted Message   : {decoded.text!r}")
 
     if decoded.text != message:
-        print("ERROR: Decrypted text did not match original!", file=sys.stderr)
+        print("│  Status              : ERROR (Decrypted text did not match original!)", file=sys.stderr)
+        print("╰──────────────────────────────────────────────────────────────────────────────────╯")
         return 1
-    print("  Status             : SUCCESS (100% lossless match)")
+    print("│  Status              : SUCCESS (100% lossless match)")
+    print("╰──────────────────────────────────────────────────────────────────────────────────╯")
     return 0
 
 
@@ -175,9 +197,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_demo = sub.add_parser("demo", help="Run full 'Hello World' encrypt & decrypt demo")
+    p_demo = sub.add_parser("demo", help="Run full 'Hello World' 2D console chess encrypt & decrypt demo")
     p_demo.add_argument("--message", default="Hello World", help="Message to encrypt")
     p_demo.add_argument("--passphrase", default=None, help="Optional encryption passphrase")
+    p_demo.add_argument(
+        "--delay",
+        type=float,
+        default=0.20,
+        help="Delay in seconds between plies for terminal 2D board animation",
+    )
+    p_demo.add_argument(
+        "--step",
+        action="store_true",
+        help="Interactive step-by-step mode (press Enter after each ply)",
+    )
+    p_demo.add_argument(
+        "--all-plies",
+        action="store_true",
+        help="Print every ply's 2D board and dictionary sequentially",
+    )
+    p_demo.add_argument(
+        "--color",
+        dest="color",
+        action="store_true",
+        default=None,
+        help="Force ANSI truecolor Lichess board rendering",
+    )
+    p_demo.add_argument(
+        "--no-color",
+        dest="color",
+        action="store_false",
+        help="Disable ANSI colors (plain ASCII 2D board)",
+    )
     p_demo.set_defaults(func=_cmd_demo)
 
     p_dict = sub.add_parser("dictionary", help="Display the Move Dictionary for a FEN position")

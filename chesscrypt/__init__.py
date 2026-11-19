@@ -6,8 +6,8 @@ from chesscrypt.encoder import (
     DecodedResult,
     EncodedGame,
     PlyTrace,
-    bytes_to_bigint,
     bigint_to_bytes,
+    bytes_to_bigint,
     decode_games,
     decode_moves,
     decode_pgn,
@@ -20,6 +20,13 @@ from chesscrypt.lichess import (
     LichessBotClient,
     LichessMatchOrchestrator,
     SimulatedLichessServer,
+)
+from chesscrypt.viewer import (
+    format_dictionary_grid,
+    format_frame_2d,
+    play_2d_terminal_match,
+    render_board_2d_lines,
+    render_progress_bar,
 )
 
 __all__ = [
@@ -42,5 +49,10 @@ __all__ = [
     "encode_bytes",
     "encode_text",
     "encrypt_payload",
+    "format_dictionary_grid",
+    "format_frame_2d",
     "get_position_dictionary",
+    "play_2d_terminal_match",
+    "render_board_2d_lines",
+    "render_progress_bar",
 ]
