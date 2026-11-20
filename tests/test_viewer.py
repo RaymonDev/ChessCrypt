@@ -88,3 +88,29 @@ def test_play_2d_terminal_match_all_plies_mode(capsys):
     out = capsys.readouterr().out
     assert "[2D Board — Ply 1/" in out
     assert "Position Move Dictionary at Ply 1" in out
+
+
+def test_dictionary_grid_shows_every_move_in_busy_positions():
+    # Queen + two rooks with castling rights: well over 36 legal moves.
+    board = chess.Board("4k3/8/8/8/3Q4/8/8/R3K2R w KQ - 0 1")
+    entries = get_position_dictionary(board)
+    assert len(entries) > 36
+    last = entries[-1]
+
+    rows = format_dictionary_grid(entries, chosen_index=last.index, columns=4, use_color=False)
+    joined = "\n".join(rows)
+    for e in entries:
+        assert f"({e.uci})" in joined
+    assert f">>[{last.index:2d}]" in joined
+
+    frame = format_frame_2d(
+        board,
+        None,
+        total_plies=1,
+        white_bot="W",
+        black_bot="B",
+        dictionary_entries=entries,
+        use_color=False,
+    )
+    assert f"({last.uci})" in frame
+    assert f"N = {len(entries)} legal moves" in frame

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -41,16 +42,29 @@ FG_GOLD = "\033[38;2;229;192;123m"
 BG_BOT_BADGE = "\033[48;2;163;87;208m\033[1;38;2;255;255;255m"
 BG_CHOSEN = "\033[48;2;98;153;36m\033[1;38;2;255;255;255m"
 
+DICTIONARY_COLUMNS = 4
+# Minimum height of the dictionary grid (rows) so short dictionaries don't make frames jump.
+MIN_DICTIONARY_ROWS = 5
+
+_vt_mode_enabled = False
+
 
 def enable_terminal_ansi() -> None:
     """Configure UTF-8 output and enable ANSI virtual terminal processing on Windows."""
+    global _vt_mode_enabled
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
-    if os.name == "nt":
-        os.system("")
+    if os.name == "nt" and not _vt_mode_enabled:
+        os.system("")  # Side effect: enables VT escape processing in the Windows console.
+        _vt_mode_enabled = True
+
+
+def dictionary_rows_needed(radix: int, columns: int = DICTIONARY_COLUMNS) -> int:
+    """Number of grid rows needed to show a dictionary of `radix` moves."""
+    return max(MIN_DICTIONARY_ROWS, -(-radix // columns))
 
 
 def visible_len(text: str) -> int:
@@ -147,23 +161,33 @@ def format_dictionary_grid(
     columns: int = 5,
     use_color: bool = True,
 ) -> list[str]:
-    """Render the current ply's Position Move Dictionary as a compact multi-column grid."""
+    """Render the current ply's Position Move Dictionary as a compact multi-column grid.
+
+    Every entry is shown; column widths adapt to the longest SAN/UCI strings.
+    """
     if not entries:
         return ["  (No legal moves)"]
+
+    san_w = max(4, max(len(e.san) for e in entries))
+    uci_w = max(len(e.uci) for e in entries)
+    # "[NN] " + SAN + " (" + UCI + ")" plus 2 markers on each side
+    cell_w = 5 + san_w + 2 + uci_w + 1 + 4
 
     cells: list[str] = []
     for e in entries:
         is_chosen = chosen_index is not None and e.index == chosen_index
-        label = f"[{e.index:2d}] {e.san:<4s} ({e.uci})"
+        uci_part = f"({e.uci})"
+        label = f"[{e.index:2d}] {e.san:<{san_w}s} {uci_part:<{uci_w + 2}s}"
         if not use_color:
             cell = f">>{label}<<" if is_chosen else f"  {label}  "
-            cells.append(f"{cell:<20s}")
+        elif is_chosen:
+            cell = f"{BG_CHOSEN} ▶{label}◀ {RESET}"
         else:
-            if is_chosen:
-                cell = f"{BG_CHOSEN} ▶[{e.index:2d}] {e.san:<4s} ({e.uci})◀ {RESET}"
-            else:
-                cell = f"  {FG_CYAN}[{e.index:2d}]{RESET} {FG_BRIGHT}{e.san:<4s}{RESET} {FG_MUTED}({e.uci}){RESET}  "
-            cells.append(pad_ansi(cell, 21))
+            cell = (
+                f"  {FG_CYAN}[{e.index:2d}]{RESET} {FG_BRIGHT}{e.san:<{san_w}s}{RESET} "
+                f"{FG_MUTED}{uci_part:<{uci_w + 2}s}{RESET}  "
+            )
+        cells.append(pad_ansi(cell, cell_w))
 
     rows: list[str] = []
     for i in range(0, len(cells), columns):
@@ -206,8 +230,13 @@ def format_frame_2d(
     dictionary_entries: list[MoveEntry] | None = None,
     all_traces: list[PlyTrace] | None = None,
     use_color: bool = True,
+    dictionary_rows: int | None = None,
 ) -> str:
-    """Render a full 2D terminal dashboard frame (Board + Match Telemetry + Move Dictionary)."""
+    """Render a full 2D terminal dashboard frame (Board + Match Telemetry + Move Dictionary).
+
+    `dictionary_rows` pads the dictionary grid to a fixed height (useful for
+    in-place animation); the grid is never truncated.
+    """
     board_lines = render_board_2d_lines(board, last_move=last_move, use_color=use_color)
 
     if use_color:
@@ -219,13 +248,19 @@ def format_frame_2d(
 
     if trace is None:
         pbar = render_progress_bar(0, total_plies, use_color=use_color)
+        radix = (
+            len(dictionary_entries)
+            if dictionary_entries is not None
+            else len(get_position_dictionary(board))
+        )
+        bits = math.log2(radix) if radix > 1 else 0.0
         hud = [
             f"  {bot_badge} {BOLD if use_color else ''}{black_bot}{RESET if use_color else ''} (Black)",
             sep,
             f"  Progress   : {pbar}",
-            "  Status     : Starting Position (Ply 0)",
+            f"  Status     : Ready to play (Ply {len(board.move_stack)})",
             "  Move Played: —",
-            "  Dict Radix : N = 20 legal moves (4.32 bits)",
+            f"  Dict Radix : N = {radix} legal moves ({bits:.2f} bits)",
             "  Dict Index : —",
             "  V (before) : Ready to encode",
             "  V (after)  : —",
@@ -298,12 +333,13 @@ def format_frame_2d(
                 f"(Sorted by UCI, N = {len(dictionary_entries)}) --"
             )
         dict_rows = format_dictionary_grid(
-            dictionary_entries, chosen_idx, columns=4, use_color=use_color
+            dictionary_entries, chosen_idx, columns=DICTIONARY_COLUMNS, use_color=use_color
         )
-        # Pad to fixed height (9 rows) so in-place terminal animation never shifts lines
-        while len(dict_rows) < 9:
+        # Pad to a fixed height so in-place terminal animation never shifts lines
+        target_rows = dictionary_rows or dictionary_rows_needed(len(dictionary_entries))
+        while len(dict_rows) < target_rows:
             dict_rows.append("")
-        combined.extend(dict_rows[:9])
+        combined.extend(dict_rows)
 
     return "\n".join(combined)
 
@@ -329,6 +365,9 @@ def play_2d_terminal_match(
     total_plies = len(encoded_game.traces)
 
     if animate_in_place:
+        # Keep every frame the same height so redrawing in place never leaves stale lines.
+        max_radix = max((t.radix for t in encoded_game.traces), default=0)
+        fixed_rows = dictionary_rows_needed(max_radix)
         prev_line_count = 0
         for idx, trace in enumerate(encoded_game.traces):
             dict_entries = get_position_dictionary(board)
@@ -344,12 +383,13 @@ def play_2d_terminal_match(
                 dictionary_entries=dict_entries,
                 all_traces=encoded_game.traces,
                 use_color=use_color,
+                dictionary_rows=fixed_rows,
             )
             if idx > 0 and prev_line_count > 0:
                 sys.stdout.write(f"\033[{prev_line_count}A")
             # Clear each line to the end so shorter lines never leave artifacts
             cleared_lines = [line + "\033[K" for line in frame.split("\n")]
-            output_block = "\n".join(cleared_lines) + "\n"
+            output_block = "\n".join(cleared_lines) + "\n\033[J"
             sys.stdout.write(output_block)
             sys.stdout.flush()
             prev_line_count = len(cleared_lines)

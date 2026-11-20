@@ -52,3 +52,35 @@ def test_format_dictionary_markdown_contains_table():
     assert "| Index (`i`) | UCI Move | SAN Move |" in md
     assert "| ` 8` | `d2d3` | **d3** |" in md
     assert "| `19` | `h2h4` | **h4** |" in md
+
+
+def test_ends_game_matches_python_chess_claim_draw_semantics():
+    """`ends_game` must agree exactly with `is_game_over(claim_draw=True)`.
+
+    Any disagreement would change dictionaries and break previously stored games.
+    """
+    import random
+
+    from chesscrypt.dictionary import ends_game
+
+    # Knight shuffle: the final Ng8 completes a claimable threefold repetition.
+    board = chess.Board()
+    for san in ["Nf3", "Nf6", "Ng1", "Ng8", "Nf3", "Nf6", "Ng1"]:
+        board.push_san(san)
+        assert ends_game(board) == board.is_game_over(claim_draw=True)
+    assert board.can_claim_threefold_repetition()
+    assert ends_game(board)
+
+    # Random games biased toward quiet moves so repetitions and 50-move cases occur.
+    rng = random.Random(1234)
+    for _ in range(15):
+        board = chess.Board()
+        for _ in range(120):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            quiet = [m for m in moves if not board.is_zeroing(m)]
+            board.push(rng.choice(quiet if quiet and rng.random() < 0.85 else moves))
+            assert ends_game(board) == board.is_game_over(claim_draw=True), board.fen()
+            if board.is_game_over():
+                break

@@ -26,7 +26,7 @@ At each half-move (ply) $t \ge 1$, the active player has $N_t$ safe legal moves 
 
 $$\mathcal{C}(K) = \prod_{t=1}^{K} N_t \quad \text{states} \implies \sum_{t=1}^{K} \log_2(N_t) \quad \text{bits}$$
 
-Wait-free fixed-bit schemes (e.g., taking only $\lfloor \log_2 N_t \rfloor$ bits per ply) waste up to $40\%$ of the available branching factor whenever $N_t$ is not a power of two (such as $N_1 = 20$, where $\lfloor \log_2 20 \rfloor = 4\text{ bits}$ wastes $\log_2(20) - 4 \approx 0.322\text{ bits/ply}$). ChessCrypt instead uses **full-precision big-integer mixed-radix arithmetic**, achieving $100\%$ of the theoretical Shannon capacity of the safe legal move set.
+Fixed-bit schemes (e.g., taking only $\lfloor \log_2 N_t \rfloor$ bits per ply) waste up to $40\%$ of the available branching factor whenever $N_t$ is not a power of two (such as $N_1 = 20$, where $\lfloor \log_2 20 \rfloor = 4\text{ bits}$ wastes $\log_2(20) - 4 \approx 0.322\text{ bits/ply}$). ChessCrypt instead uses **full-precision big-integer mixed-radix arithmetic**, achieving $100\%$ of the theoretical Shannon capacity of the safe legal move set.
 
 ---
 
@@ -55,7 +55,7 @@ Given the reconstructed integer $V_0 \ge 1$:
 
 ## 3. Authenticated Encryption Layer (PBKDF2 + SHA-256-CTR + HMAC)
 
-When a passphrase $P$ is supplied (`--passphrase`), the raw plaintext $M$ is encrypted and authenticated **before** mixed-radix move encoding ([chesscrypt/crypto.py](file:///C:/Users/ramon/Documents/GitHub/ChessCrypt/chesscrypt/crypto.py)):
+When a passphrase $P$ is supplied (`--passphrase`), the raw plaintext $M$ is encrypted and authenticated **before** mixed-radix move encoding ([chesscrypt/crypto.py](chesscrypt/crypto.py)):
 
 ```mermaid
 flowchart LR
@@ -77,13 +77,15 @@ flowchart LR
    $$K_{\text{stream}, j} = \operatorname{SHA256}(K_e \,\|\, S \,\|\, \operatorname{uint32\_be}(j)), \qquad C = M \oplus K_{\text{stream}}$$
 3. **Authentication Tag (Encrypt-then-MAC):**
    $$T = \operatorname{HMAC-SHA256}(K_m, S \,\|\, C)_{0..7}$$
-   Upon decoding a game, $T$ is verified in constant time (`hmac.compare_digest`). If a single move in the PGN was altered or the passphrase is wrong, `CryptoError` is raised immediately.
+   Upon decoding, $T$ is verified in constant time (`hmac.compare_digest`) before any plaintext is released. A wrong passphrase raises `CryptoError`; an altered PGN is rejected either during move decoding (illegal move, move outside the dictionary, or a bad `0x01` sentinel) or by the tag check.
+
+> **Design trade-offs.** The 8-byte salt and 8-byte (64-bit) tag keep the overhead at 16 bytes (≈ 26 extra plies) per message. A 64-bit tag is ample against online forgery but below the 128-bit tags of standard AEAD schemes, and 100,000 PBKDF2 iterations is below current OWASP guidance (600,000 for SHA-256). Changing either would alter the payload format and make previously stored games undecodable, so they are documented here rather than silently changed.
 
 ---
 
 ## 4. The Deterministic Position Move Dictionary
 
-At every ply $t$, both the encoder and decoder construct an identical, zero-indexed **Position Move Dictionary** $\mathcal{D}(\text{board}_t) = [m_0, m_1, \dots, m_{N_t - 1}]$ ([chesscrypt/dictionary.py](file:///C:/Users/ramon/Documents/GitHub/ChessCrypt/chesscrypt/dictionary.py)):
+At every ply $t$, both the encoder and decoder construct an identical, zero-indexed **Position Move Dictionary** $\mathcal{D}(\text{board}_t) = [m_0, m_1, \dots, m_{N_t - 1}]$ ([chesscrypt/dictionary.py](chesscrypt/dictionary.py)):
 
 1. **Candidate Enumeration:** Generate all legal moves in $\text{board}_t$.
 2. **1-Ply Safe Continuation Lookahead (`_is_safe_continuation`):**
@@ -93,6 +95,8 @@ At every ply $t$, both the encoder and decoder construct an identical, zero-inde
    *(If every legal move is terminal in a deep endgame, the filter gracefully falls back to non-terminal moves and then all legal moves.)*
 3. **Canonical Lexicographical UCI Ordering:**
    All safe moves are sorted strictly by their UCI string representation (`from_square + to_square + promotion`, e.g., `a2a3 < a2a4 < b1a3 < b1c3 < ... < h2h4`).
+
+> **Implementation note.** The terminal-position test (`ends_game`) is exactly `board.is_game_over(claim_draw=True)`. Because a position can only recur after at least four reversible plies, python-chess's expensive threefold-repetition scan is skipped while `halfmove_clock < 4`. This changes speed only, never the dictionary, so it is fully compatible with games encoded earlier (verified by a differential test in `tests/test_dictionary.py`).
 
 ### Complete Opening Dictionary Reference (Ply 1 & Ply 2)
 
@@ -158,7 +162,7 @@ Given the observed move sequence $(m_1, m_2, \dots, m_K)$:
 - **UTF-8 Hex:** `48 65 6c 6c 6f 20 57 6f 72 6c 64`
 - **Sentinel-Prefixed Hex (`12 bytes = 96 bits`):** `01 48 65 6c 6c 6f 20 57 6f 72 6c 64`
 - **Initial BigInt ($V_0$):**
-  $$V_0 = \mathtt{0x0148656c6c6f20576f726c64}_{16} = \mathbf{39,700,662,791,022,760,251,689,6868}_{10}$$
+  $$V_0 = \mathtt{0x0148656c6c6f20576f726c64}_{16} = \mathbf{397{,}006{,}627{,}910{,}227{,}602{,}516{,}896{,}868}_{10}$$
 
 ### Step-by-Step Division & Move Selection ($t = 1 \dots 20$)
 
@@ -190,7 +194,7 @@ Summing $i_t \cdot M_t$ from $t = 1$ to $20$:
 
 $$\begin{aligned}
 V_0 &= 8(1) + 3(20) + 19(400) + 13(10{,}800) + \dots + 22(4.6137\times 10^{24}) + 2(1.4764\times 10^{26}) \\
-    &= \mathbf{39,700,662,791,022,760,251,689,6868} \\
+    &= \mathbf{397{,}006{,}627{,}910{,}227{,}602{,}516{,}896{,}868} \\
     &= \mathtt{0x0148656c6c6f20576f726c64}_{16} \xrightarrow{\text{strip } \mathtt{0x01}} \texttt{"Hello World"}
 \end{aligned}$$
 
@@ -199,9 +203,10 @@ V_0 &= 8(1) + 3(20) + 19(400) + 13(10{,}800) + \dots + 22(4.6137\times 10^{24}) 
 ## 7. Multi-Game Chunking & Capacity Analysis
 
 - **Default Chunk Size (`DEFAULT_MAX_CHUNK_BYTES = 32`):**
-  A 32-byte chunk ($+1\text{ sentinel byte} = 264\text{ bits}$) requires roughly $264 / 4.7 \approx 56\text{ plies}$ ($28\text{ full moves}$), keeping every game short, fast to play over the Lichess Bot API, and well below the 50-move draw limit.
+  A 32-byte chunk ($+1\text{ sentinel byte} = 264\text{ bits}$) averages $\approx 4.9\text{ bits/ply}$ and therefore needs about $53\text{ plies}$ (range $51$–$56$ in random-data trials), roughly $27$ full moves. That keeps every game short and fast to play over the Lichess Bot API.
 - **Multi-Game Splitting:**
-  Payloads exceeding `max_chunk_bytes` are partitioned into ordered chunks $C_1, C_2, \dots, C_G$. Each chunk $C_g$ is encoded as an independent legal game tagged with PGN header `[Round "g/G"]`. During decoding, `decode_pgn` or `decode_games` decodes each game $g$ back into $C_g$, concatenates $C_1 \,\|\, C_2 \,\|\, \dots \,\|\, C_G$, and passes the reassembled payload to `decrypt_payload`.
+  Payloads exceeding `max_chunk_bytes` are partitioned into ordered chunks $C_1, C_2, \dots, C_G$. Each chunk $C_g$ is encoded as an independent legal game tagged with PGN header `[Round "g/G"]`. During decoding, `decode_pgn` sorts games by that header (so the PGN may list them in any order), rejects missing or duplicated parts, decodes each game back into $C_g$, concatenates $C_1 \,\|\, C_2 \,\|\, \dots \,\|\, C_G$, and passes the reassembled payload to `decrypt_payload`.
+- **Ordering without headers:** Games played on Lichess do not keep ChessCrypt's `[Round "g/G"]` tag, so games fetched from Lichess are decoded in the order their IDs are given (`chesscrypt fetch-lichess ID1 ID2 …`). Keep the IDs printed by `store-lichess` in order.
 
 ---
 
@@ -230,5 +235,8 @@ sequenceDiagram
     L-->>W: Standard PGN -> decode_pgn() -> Original Data
 ```
 
-1. **Bot Upgrade Prerequisite:** Both accounts must have $0$ prior human games played and be upgraded once via `POST /api/bot/account/upgrade` (`python -m chesscrypt setup-bots`).
-2. **Hardcoded Unrated Enforcement:** `LichessBotClient.create_challenge` rejects `rated=True` with a `ValueError` and always transmits `rated="false"`. This guarantees compliance with Lichess Fair Play guidelines by never touching rated matchmaking pools.
+1. **Bot Upgrade Prerequisite:** Both accounts must have $0$ prior games played and be upgraded once via `POST /api/bot/account/upgrade` (`chesscrypt setup-bots`).
+2. **Hardcoded Unrated Enforcement:** `LichessBotClient.create_challenge` rejects `rated=True` with a `ValueError` and always transmits `rated="false"`, so the bots never touch rated pools.
+3. **Minimum Game Length:** Lichess aborts (rather than archives) games with fewer than 2 plies, so the orchestrator refuses to store such games. Only the empty payload encodes to a single ply.
+4. **Failure Handling:** If any move is rejected mid-game, the orchestrator resigns the game before re-raising, so no half-played game is left running. HTTP `429` responses are retried once after the one-minute back-off Lichess requires.
+5. **Retrieval:** Archived games are public, so `chesscrypt fetch-lichess <id>…` downloads them via `GET /game/export/{gameId}` without a token and decodes them.

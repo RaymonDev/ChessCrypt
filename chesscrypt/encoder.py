@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import io
+import re
 import chess
 import chess.pgn
 
 from chesscrypt.crypto import decrypt_payload, encrypt_payload
-from chesscrypt.dictionary import get_position_dictionary
+from chesscrypt.dictionary import MoveEntry, get_position_dictionary
 
 DEFAULT_MAX_CHUNK_BYTES = 32
 DEFAULT_WHITE_BOT = "RookCipherBot"
 DEFAULT_BLACK_BOT = "PawnVaultBot"
+
+_ROUND_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+_SAN_ANNOTATIONS = "+#!?"
+
+
+def pgn_date_today() -> str:
+    """Return today's UTC date in PGN `YYYY.MM.DD` format."""
+    return datetime.now(timezone.utc).strftime("%Y.%m.%d")
 
 
 def bytes_to_bigint(chunk: bytes) -> int:
@@ -80,25 +90,27 @@ class EncodedGame:
     def total_bits_capacity(self) -> float:
         return sum(t.bits_capacity for t in self.traces)
 
-    def to_pgn(self, game_id: str | None = None) -> str:
-        """Export this encoded game as a standard PGN string."""
+    def to_pgn(self, game_id: str | None = None, *, date: str | None = None) -> str:
+        """Export this encoded game as a standard PGN string.
+
+        The `Round` header is set to `"<game_index>/<total_games>"` so that
+        `decode_pgn` can reassemble multi-game payloads in the right order.
+        `date` defaults to today's UTC date (PGN `YYYY.MM.DD` format).
+        """
         game = chess.pgn.Game()
         game.headers["Event"] = "ChessCrypt Unrated Bot Storage"
         game.headers["Site"] = (
             f"https://lichess.org/{game_id}" if game_id else "https://lichess.org"
         )
-        game.headers["Date"] = "2026.11.19"
+        game.headers["Date"] = date or pgn_date_today()
         game.headers["Round"] = f"{self.game_index}/{self.total_games}"
         game.headers["White"] = self.white_name
         game.headers["Black"] = self.black_name
         game.headers["Result"] = "*"
 
         node: chess.pgn.GameNode = game
-        board = chess.Board()
         for trace in self.traces:
-            move = chess.Move.from_uci(trace.uci)
-            node = node.add_variation(move)
-            board.push(move)
+            node = node.add_variation(chess.Move.from_uci(trace.uci))
 
         exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)
         return game.accept(exporter).strip()
@@ -276,13 +288,7 @@ def _decode_single_game_moves(moves: list[str]) -> tuple[bytes, int, list[PlyTra
         dictionary = get_position_dictionary(board)
         radix = len(dictionary)
 
-        # Match either UCI (e.g. 'e2e4') or SAN (e.g. 'e4')
-        matched_entry = None
-        for entry in dictionary:
-            if entry.uci == token or entry.san == token:
-                matched_entry = entry
-                break
-
+        matched_entry = _match_move(dictionary, token)
         if matched_entry is None:
             raise ValueError(
                 f"Move {token!r} at ply {ply_idx} is not in the valid ChessCrypt "
@@ -291,7 +297,6 @@ def _decode_single_game_moves(moves: list[str]) -> tuple[bytes, int, list[PlyTra
 
         v_before = accumulated_v
         accumulated_v += matched_entry.index * multiplier
-        Next_multiplier = multiplier * radix
 
         traces.append(
             PlyTrace(
@@ -310,10 +315,23 @@ def _decode_single_game_moves(moves: list[str]) -> tuple[bytes, int, list[PlyTra
             )
         )
         board.push(matched_entry.move)
-        multiplier = Next_multiplier
+        multiplier *= radix
 
     chunk_bytes = bigint_to_bytes(accumulated_v)
     return chunk_bytes, accumulated_v, traces
+
+
+def _match_move(dictionary: list[MoveEntry], token: str) -> MoveEntry | None:
+    """Find the dictionary entry for a UCI (`e2e4`) or SAN (`e4`, `Qh4+`, `Nf3!?`) token.
+
+    Check/mate markers and annotation glyphs are ignored when matching SAN, so
+    `Qh4`, `Qh4+` and `Qh4+!` all resolve to the same move.
+    """
+    bare = token.rstrip(_SAN_ANNOTATIONS)
+    for entry in dictionary:
+        if entry.uci == token or entry.san.rstrip(_SAN_ANNOTATIONS) == bare:
+            return entry
+    return None
 
 
 def decode_games(
@@ -350,19 +368,59 @@ def decode_pgn(
     *,
     passphrase: str | None = None,
 ) -> DecodedResult:
-    """Parse one or more games from a PGN string and decode the embedded data."""
+    """Parse one or more games from a PGN string and decode the embedded data.
+
+    If every game carries a ChessCrypt `[Round "g/G"]` header, games are
+    reassembled in round order (so the PGN may list them in any order) and a
+    missing or duplicated part raises `ValueError`. Otherwise (e.g. PGNs
+    exported from Lichess) games are decoded in the order they appear.
+    """
     stream = io.StringIO(pgn_text.strip())
-    games_moves: list[list[str]] = []
+    parsed: list[tuple[str, list[str]]] = []
 
     while True:
-        game = chess.pgn.read_game(stream)
+        game = chess.pgn.read_game(stream, Visitor=_CollectingGameBuilder)
         if game is None:
             break
+        if game.errors:
+            raise ValueError(
+                f"PGN game #{len(parsed) + 1} contains an illegal or unreadable move: "
+                f"{game.errors[0]}"
+            )
         moves = [move.uci() for move in game.mainline_moves()]
         if moves:
-            games_moves.append(moves)
+            parsed.append((game.headers.get("Round", ""), moves))
 
-    if not games_moves:
+    if not parsed:
         raise ValueError("No valid chess games with moves found in PGN text.")
 
-    return decode_games(games_moves, passphrase=passphrase)
+    return decode_games(_order_games_by_round(parsed), passphrase=passphrase)
+
+
+class _CollectingGameBuilder(chess.pgn.GameBuilder):
+    """GameBuilder that records parse errors on the game without logging them."""
+
+    def handle_error(self, error: Exception) -> None:
+        self.game.errors.append(error)
+
+
+def _order_games_by_round(parsed: list[tuple[str, list[str]]]) -> list[list[str]]:
+    """Sort games by their `[Round "g/G"]` header when all games carry one."""
+    rounds = [_ROUND_RE.match(round_tag) for round_tag, _ in parsed]
+    if not all(rounds):
+        return [moves for _, moves in parsed]
+
+    totals = {int(m.group(2)) for m in rounds}  # type: ignore[union-attr]
+    indices = [int(m.group(1)) for m in rounds]  # type: ignore[union-attr]
+    if len(totals) != 1:
+        raise ValueError(f"PGN games disagree on the total part count: {sorted(totals)}.")
+    total = totals.pop()
+    if sorted(indices) != list(range(1, total + 1)):
+        missing = sorted(set(range(1, total + 1)) - set(indices))
+        detail = f"missing part(s) {missing}" if missing else "duplicate parts"
+        raise ValueError(
+            f"Incomplete ChessCrypt payload: expected rounds 1..{total}, {detail}."
+        )
+
+    ordered = sorted(zip(indices, (moves for _, moves in parsed)), key=lambda p: p[0])
+    return [moves for _, moves in ordered]

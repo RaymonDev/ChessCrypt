@@ -36,15 +36,37 @@ class MoveEntry:
         return math.log2(self.total_moves) if self.total_moves > 1 else 0.0
 
 
+# A position can only recur after both sides have made at least two reversible
+# moves (e.g. Nf3 Nf6 Ng1 Ng8), so threefold repetition cannot be claimed while
+# fewer than 4 plies have passed since the last capture or pawn move.
+_MIN_PLIES_FOR_REPETITION = 4
+
+
+def ends_game(board: chess.Board) -> bool:
+    """Return True if the game is over or a draw can be claimed in `board`.
+
+    Exactly equivalent to ``board.is_game_over(claim_draw=True)``, but skips
+    python-chess's expensive threefold-repetition scan when no repetition is
+    possible yet. That scan dominates encoding time, so this shortcut makes
+    dictionary construction several times faster without changing its output.
+    """
+    if board.is_game_over() or board.can_claim_fifty_moves():
+        return True
+    return (
+        board.halfmove_clock >= _MIN_PLIES_FOR_REPETITION
+        and board.can_claim_threefold_repetition()
+    )
+
+
 def _is_safe_continuation(board: chess.Board, move: chess.Move) -> bool:
     """Return True if pushing `move` does not end the game and leaves at least 1 non-terminal reply."""
     board.push(move)
     try:
-        if board.is_game_over(claim_draw=True):
+        if ends_game(board):
             return False
         for reply in board.legal_moves:
             board.push(reply)
-            over = board.is_game_over(claim_draw=True)
+            over = ends_game(board)
             board.pop()
             if not over:
                 return True
@@ -72,7 +94,7 @@ def get_safe_legal_moves(board: chess.Board) -> list[chess.Move]:
     non_terminal = []
     for m in all_legal:
         board.push(m)
-        if not board.is_game_over(claim_draw=True):
+        if not ends_game(board):
             non_terminal.append(m)
         board.pop()
     if non_terminal:

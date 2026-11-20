@@ -96,3 +96,51 @@ def test_http_lichess_bot_client_endpoints():
         "https://lichess.org/api/bot/game/g1234567/move/d2d3",
         timeout=15.0,
     )
+
+
+def test_client_without_token_sends_no_authorization_header():
+    session = MagicMock()
+    session.headers = {}
+    LichessBotClient(token=None, session=session)
+    assert "Authorization" not in session.headers
+
+
+def test_network_errors_are_wrapped_in_lichess_api_error():
+    import requests
+
+    session = MagicMock()
+    session.get.side_effect = requests.ConnectionError("connection refused")
+    client = LichessBotClient("tok", session=session)
+    with pytest.raises(LichessAPIError, match="connection refused"):
+        client.export_game_pgn("AbCd1234")
+
+
+def test_rate_limited_request_is_retried_once():
+    session = MagicMock()
+    session.post.side_effect = [MagicMock(status_code=429), MagicMock(status_code=200)]
+    client = LichessBotClient("tok", session=session, rate_limit_wait=0.001)
+    assert client.make_move("AbCd1234", "e2e4") is True
+    assert session.post.call_count == 2
+
+
+def test_orchestrator_rejects_games_lichess_would_abort():
+    server = SimulatedLichessServer()
+    orchestrator = LichessMatchOrchestrator(
+        server.create_client(BOT_WHITE_NAME), server.create_client(BOT_BLACK_NAME)
+    )
+    with pytest.raises(ValueError, match="fewer than 2 plies"):
+        orchestrator.store_text("")
+    assert server.challenges == {}
+
+
+def test_orchestrator_resigns_game_when_a_move_fails():
+    server = SimulatedLichessServer()
+    white = server.create_client(BOT_WHITE_NAME)
+    black = server.create_client(BOT_BLACK_NAME)
+    black.make_move = MagicMock(side_effect=LichessAPIError("boom"))
+    orchestrator = LichessMatchOrchestrator(white, black)
+
+    with pytest.raises(LichessAPIError, match="boom"):
+        orchestrator.store_text("Hello World")
+    (game,) = server.games.values()
+    assert game.status == "resign"

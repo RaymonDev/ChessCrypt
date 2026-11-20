@@ -17,6 +17,7 @@ from chesscrypt.encoder import (
 from chesscrypt.lichess import (
     BOT_BLACK_NAME,
     BOT_WHITE_NAME,
+    LichessAPIError,
     LichessBotClient,
     LichessMatchOrchestrator,
     SimulatedLichessServer,
@@ -35,6 +36,7 @@ __all__ = [
     "CryptoError",
     "DecodedResult",
     "EncodedGame",
+    "LichessAPIError",
     "LichessBotClient",
     "LichessMatchOrchestrator",
     "MoveEntry",

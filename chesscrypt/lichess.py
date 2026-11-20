@@ -12,16 +12,23 @@ import chess.pgn
 import requests
 
 from chesscrypt.encoder import (
+    DEFAULT_MAX_CHUNK_BYTES,
     DecodedResult,
     EncodedGame,
     decode_pgn,
     encode_bytes,
     encode_text,
+    pgn_date_today,
 )
 
 LICHESS_BASE_URL = "https://lichess.org"
 BOT_WHITE_NAME = "RookCipherBot"
 BOT_BLACK_NAME = "PawnVaultBot"
+
+# Lichess aborts (rather than archives) games in which fewer than 2 plies were played.
+MIN_ARCHIVABLE_PLIES = 2
+# Lichess asks API clients to wait a full minute after an HTTP 429 response.
+RATE_LIMIT_WAIT_SECONDS = 60.0
 
 
 class LichessAPIError(RuntimeError):
@@ -51,36 +58,54 @@ class BotClientProtocol(Protocol):
 
 
 class LichessBotClient:
-    """Official Lichess Bot API client using Personal Access Tokens (OAuth2)."""
+    """Official Lichess Bot API client using Personal Access Tokens (OAuth2).
+
+    `token` may be omitted for read-only access to public endpoints such as
+    `export_game_pgn`.
+    """
 
     def __init__(
         self,
-        token: str,
+        token: str | None = None,
         username: str = BOT_WHITE_NAME,
         *,
         base_url: str = LICHESS_BASE_URL,
         session: requests.Session | None = None,
         timeout: float = 15.0,
+        rate_limit_wait: float = RATE_LIMIT_WAIT_SECONDS,
     ) -> None:
         self.token = token
         self.username = username
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.rate_limit_wait = rate_limit_wait
         self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-            }
-        )
+        self.session.headers.update({"Accept": "application/json"})
+        if token:
+            self.session.headers.update({"Authorization": f"Bearer {token}"})
+
+    def _send(self, method: str, url: str, action: str, **kwargs) -> requests.Response:
+        """Send a request, retrying once after an HTTP 429, and raise on failure.
+
+        `action` is a short description used in error messages.
+        """
+        sender = getattr(self.session, method)
+        for attempt in range(2):
+            try:
+                resp = sender(url, timeout=self.timeout, **kwargs)
+            except requests.RequestException as exc:
+                raise LichessAPIError(f"Failed to {action}: {exc}") from exc
+            if resp.status_code == 429 and attempt == 0 and self.rate_limit_wait > 0:
+                time.sleep(self.rate_limit_wait)
+                continue
+            break
+        if resp.status_code not in (200, 201):
+            raise LichessAPIError(f"Failed to {action} ({resp.status_code}): {resp.text}")
+        return resp
 
     def get_account(self) -> dict:
         """Fetch the authenticated Lichess user profile (`GET /api/account`)."""
-        resp = self.session.get(f"{self.base_url}/api/account", timeout=self.timeout)
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to fetch Lichess account ({resp.status_code}): {resp.text}"
-            )
+        resp = self._send("get", f"{self.base_url}/api/account", "fetch Lichess account")
         data = resp.json()
         if "username" in data:
             self.username = data["username"]
@@ -96,14 +121,11 @@ class LichessBotClient:
         if account.get("title") == "BOT":
             return True
 
-        resp = self.session.post(
+        self._send(
+            "post",
             f"{self.base_url}/api/bot/account/upgrade",
-            timeout=self.timeout,
+            f"upgrade {self.username} to BOT",
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to upgrade {self.username} to BOT ({resp.status_code}): {resp.text}"
-            )
         return True
 
     def create_challenge(
@@ -126,62 +148,54 @@ class LichessBotClient:
             "color": color,
             "variant": "standard",
         }
-        resp = self.session.post(
+        resp = self._send(
+            "post",
             f"{self.base_url}/api/challenge/{opponent_username}",
+            f"create challenge vs {opponent_username}",
             data=payload,
-            timeout=self.timeout,
         )
-        if resp.status_code not in (200, 201):
-            raise LichessAPIError(
-                f"Failed to create challenge vs {opponent_username} ({resp.status_code}): {resp.text}"
-            )
         data = resp.json()
         return data.get("challenge", data)
 
     def accept_challenge(self, challenge_id: str) -> bool:
         """Accept an incoming challenge (`POST /api/challenge/{challengeId}/accept`)."""
-        resp = self.session.post(
+        self._send(
+            "post",
             f"{self.base_url}/api/challenge/{challenge_id}/accept",
-            timeout=self.timeout,
+            f"accept challenge {challenge_id}",
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to accept challenge {challenge_id} ({resp.status_code}): {resp.text}"
-            )
         return True
 
     def make_move(self, game_id: str, uci_move: str) -> bool:
         """Play a UCI move in an active bot game (`POST /api/bot/game/{gameId}/move/{move}`)."""
-        resp = self.session.post(
+        self._send(
+            "post",
             f"{self.base_url}/api/bot/game/{game_id}/move/{uci_move}",
-            timeout=self.timeout,
+            f"play move {uci_move} in game {game_id}",
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to play move {uci_move} in game {game_id} ({resp.status_code}): {resp.text}"
-            )
         return True
 
     def resign_game(self, game_id: str) -> bool:
         """Resign an active bot game (`POST /api/bot/game/{gameId}/resign`)."""
-        resp = self.session.post(
+        self._send(
+            "post",
             f"{self.base_url}/api/bot/game/{game_id}/resign",
-            timeout=self.timeout,
+            f"resign game {game_id}",
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to resign game {game_id} ({resp.status_code}): {resp.text}"
-            )
         return True
 
     def stream_game_events(self, game_id: str) -> Iterator[dict]:
         """Stream NDJSON game events (`GET /api/bot/game/stream/{gameId}`)."""
-        with self.session.get(
-            f"{self.base_url}/api/bot/game/stream/{game_id}",
-            headers={"Accept": "application/x-ndjson"},
-            stream=True,
-            timeout=self.timeout,
-        ) as resp:
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/bot/game/stream/{game_id}",
+                headers={"Accept": "application/x-ndjson"},
+                stream=True,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise LichessAPIError(f"Failed to stream game {game_id}: {exc}") from exc
+        with resp:
             if resp.status_code != 200:
                 raise LichessAPIError(
                     f"Failed to stream game {game_id} ({resp.status_code}): {resp.text}"
@@ -191,17 +205,17 @@ class LichessBotClient:
                     yield json.loads(line.decode("utf-8"))
 
     def export_game_pgn(self, game_id: str) -> str:
-        """Download the archived PGN of a game (`GET /game/export/{gameId}`)."""
-        resp = self.session.get(
+        """Download the archived PGN of a game (`GET /game/export/{gameId}`).
+
+        Public games can be exported without a token.
+        """
+        resp = self._send(
+            "get",
             f"{self.base_url}/game/export/{game_id}",
+            f"export PGN for game {game_id}",
             params={"clocks": "false", "evals": "false", "opening": "false"},
             headers={"Accept": "application/x-chess-pgn"},
-            timeout=self.timeout,
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to export PGN for game {game_id} ({resp.status_code}): {resp.text}"
-            )
         return resp.text.strip()
 
     def export_user_games_pgn(
@@ -221,16 +235,13 @@ class LichessBotClient:
         }
         if vs:
             params["vs"] = vs
-        resp = self.session.get(
+        resp = self._send(
+            "get",
             f"{self.base_url}/api/games/user/{target}",
+            f"export games for user {target}",
             params=params,
             headers={"Accept": "application/x-chess-pgn"},
-            timeout=self.timeout,
         )
-        if resp.status_code != 200:
-            raise LichessAPIError(
-                f"Failed to export games for user {target} ({resp.status_code}): {resp.text}"
-            )
         return resp.text.strip()
 
 
@@ -363,7 +374,7 @@ class SimulatedLichessBotClient:
         game = chess.pgn.Game()
         game.headers["Event"] = "Casual Bot Game"
         game.headers["Site"] = f"https://lichess.org/{sim_game.game_id}"
-        game.headers["Date"] = "2026.11.19"
+        game.headers["Date"] = pgn_date_today()
         game.headers["White"] = sim_game.white
         game.headers["Black"] = sim_game.black
         game.headers["Result"] = sim_game.result
@@ -414,6 +425,13 @@ class LichessMatchOrchestrator:
 
     def play_encoded_game(self, encoded_game: EncodedGame) -> PlayedMatchRecord:
         """Have White challenge Black to an unrated match and play out `encoded_game`."""
+        if len(encoded_game.traces) < MIN_ARCHIVABLE_PLIES:
+            raise ValueError(
+                f"Game {encoded_game.game_index} has only {len(encoded_game.traces)} ply; "
+                f"Lichess aborts games with fewer than {MIN_ARCHIVABLE_PLIES} plies "
+                "instead of archiving them. Store a non-empty payload."
+            )
+
         challenge = self.white_client.create_challenge(
             self.black_client.username,
             rated=False,
@@ -424,25 +442,33 @@ class LichessMatchOrchestrator:
         game_id = challenge["id"]
         self.black_client.accept_challenge(game_id)
 
-        for trace in encoded_game.traces:
-            active_client = (
-                self.white_client if trace.turn == "White" else self.black_client
-            )
-            active_client.make_move(game_id, trace.uci)
-            if self.move_delay_seconds > 0:
-                time.sleep(self.move_delay_seconds)
-
         # Conclude the game cleanly by having the next-to-move bot resign
         next_to_move_is_white = len(encoded_game.traces) % 2 == 0
         resigning_client = (
             self.white_client if next_to_move_is_white else self.black_client
         )
+        try:
+            for trace in encoded_game.traces:
+                active_client = (
+                    self.white_client if trace.turn == "White" else self.black_client
+                )
+                active_client.make_move(game_id, trace.uci)
+                if self.move_delay_seconds > 0:
+                    time.sleep(self.move_delay_seconds)
+        except Exception:
+            # Don't leave a half-played game running on the server.
+            try:
+                self.white_client.resign_game(game_id)
+            except Exception:
+                pass
+            raise
+
         resigning_client.resign_game(game_id)
 
         pgn = self.white_client.export_game_pgn(game_id)
         return PlayedMatchRecord(
             game_id=game_id,
-            url=f"https://lichess.org/{game_id}",
+            url=f"{LICHESS_BASE_URL}/{game_id}",
             white_bot=self.white_client.username,
             black_bot=self.black_client.username,
             rated=False,
@@ -456,7 +482,7 @@ class LichessMatchOrchestrator:
         text: str,
         *,
         passphrase: str | None = None,
-        max_chunk_bytes: int = 32,
+        max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     ) -> list[PlayedMatchRecord]:
         """Encode `text` into chess game(s) and play them out between the two unrated bots."""
         games = encode_text(
@@ -473,7 +499,7 @@ class LichessMatchOrchestrator:
         data: bytes,
         *,
         passphrase: str | None = None,
-        max_chunk_bytes: int = 32,
+        max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     ) -> list[PlayedMatchRecord]:
         """Encode `data` into chess game(s) and play them out between the two unrated bots."""
         games = encode_bytes(

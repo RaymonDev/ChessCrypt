@@ -90,3 +90,42 @@ def test_multi_game_chunking_for_large_payload():
 def test_invalid_move_raises_value_error():
     with pytest.raises(ValueError, match="not in the valid ChessCrypt"):
         decode_moves(["e2e5"])
+
+
+def _multi_game_pgns(message: bytes, chunk: int = 8) -> list[str]:
+    games = encode_bytes(message, max_chunk_bytes=chunk)
+    assert len(games) >= 3
+    return [g.to_pgn() for g in games]
+
+
+def test_decode_pgn_reassembles_games_by_round_header():
+    message = b"Order must not depend on PGN file order!"
+    pgns = _multi_game_pgns(message)
+    shuffled = "\n\n".join(reversed(pgns))
+    assert decode_pgn(shuffled).decrypted_bytes == message
+
+
+def test_decode_pgn_reports_missing_part():
+    pgns = _multi_game_pgns(b"Order must not depend on PGN file order!")
+    with pytest.raises(ValueError, match=r"missing part\(s\) \[2\]"):
+        decode_pgn("\n\n".join(pgns[:1] + pgns[2:]))
+
+
+def test_decode_pgn_rejects_illegal_move_instead_of_truncating():
+    pgn = encode_text("Hello World")[0].to_pgn().replace("Qa4", "Qa5")
+    with pytest.raises(ValueError, match="illegal or unreadable move"):
+        decode_pgn(pgn)
+
+
+def test_decode_san_ignores_check_and_annotation_suffixes():
+    game = encode_text("Hello World")[0]
+    annotated = [san + ("!?" if i % 3 == 0 else "") for i, san in enumerate(game.san_moves)]
+    assert decode_moves(annotated).text == "Hello World"
+
+
+def test_to_pgn_uses_current_date_by_default():
+    from chesscrypt.encoder import pgn_date_today
+
+    game = encode_text("Hi")[0]
+    assert f'[Date "{pgn_date_today()}"]' in game.to_pgn()
+    assert '[Date "2001.02.03"]' in game.to_pgn(date="2001.02.03")
